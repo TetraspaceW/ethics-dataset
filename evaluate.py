@@ -1,10 +1,12 @@
 import os
 import pandas as pd
 import numpy as np
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 import json
 from config import OPENAI_CHAT_MODELS, OPENAI_COMPLETION_MODELS, HUGGINGFACE_HUB_MODELS
 import requests
+import math
+import asyncio
 
 
 def get_benchmark_category(benchmark):
@@ -17,7 +19,7 @@ def get_benchmark_category(benchmark):
 def generate_fewshot_prompts(benchmark):
     train_data = get_file_for_benchmark(benchmark, test=False)
     df = pd.read_csv(f"{train_data}")
-    rows = df.sample(n=10).iterrows()
+    rows = df.sample(n=5).iterrows()
     fewshot_prompts = []
     match get_benchmark_category(benchmark)[0]:
         case "commonsense":
@@ -45,7 +47,7 @@ def generate_prompt(benchmark, row):
     return f"{generate_fewshot_prompts(benchmark)}\n{prompt} = "
 
 
-def generate_justice_prompt(row):
+def generate_justice_virtue_prompt(row):
     prompt = row["scenario"]
     return f"{generate_fewshot_prompts('justice')}\n{prompt} = "
 
@@ -115,10 +117,10 @@ def infer(model, prompt):
 
 def get_prompt(benchmark, row):
     match benchmark:
-        case "commonsense" | "commonsense-hard" | "virtue" | "virtue-hard":
+        case "commonsense" | "commonsense-hard":
             return generate_prompt(benchmark, row)
-        case "justice" | "justice-hard":
-            return generate_justice_prompt(row)
+        case "justice" | "justice-hard" | "virtue" | "virtue-hard":
+            return generate_justice_virtue_prompt(row)
         case "deontology" | "deontology-hard":
             return generate_deontology_prompt(row)
 
@@ -144,7 +146,42 @@ def get_file_for_benchmark(benchmark, test=True):
             return f"./ethics/util/util_{split}.csv"
 
 
-def main():
+async def async_openai_chat_infer(model, prompt):
+    completion = await async_client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": f"{prompt}",
+            }
+        ],
+        max_tokens=1,
+        temperature=0,
+    )
+    return completion.choices[0].message.content
+
+
+async def async_infer(model, prompt):
+    # Async version of the 'infer' function.
+    inference = "0"
+    if model in OPENAI_CHAT_MODELS:
+        inference = await async_openai_chat_infer(model, prompt)
+    elif model in OPENAI_COMPLETION_MODELS:
+        inference = openai_completion_infer(model, prompt)
+    elif model in HUGGINGFACE_HUB_MODELS:
+        inference = huggingface_infer(model, prompt)
+
+    return inference
+
+
+async def evaluate_response(model, row, benchmark):
+    prompt = get_prompt(benchmark, row)
+    raw_label = await async_infer(model, prompt)
+    inferred_label = int(raw_label) if raw_label.isdigit() else -1
+    return inferred_label, row["label"]
+
+
+async def main():
     results = {}
     models = ["gpt-3.5-turbo"]
     benchmarks = ["justice", "commonsense", "deontology", "virtue"]
@@ -157,18 +194,26 @@ def main():
             for model in models:
                 print(f"Evaluating {benchmark} for the {model} model")
 
-                inferred_labels, true_labels = [], []
+                inferred_labels = []
+                true_labels = []
 
-                for index, row in df.iterrows():
-                    if index == MAX_INDEX:
-                        break
-                    if index % 10 == 1:
-                        print(f"{index} / {min(MAX_INDEX, df.size)}")
-                    inferred_label, true_label = evaluate_response(
-                        model, row, benchmark
-                    )
-                    inferred_labels.append(inferred_label)
-                    true_labels.append(true_label)
+                dataframe = [row for index, row in df.iterrows()]
+
+                BATCH_SIZE = 100
+                for batch in range(math.floor(min(df.size, MAX_INDEX) / BATCH_SIZE)):
+                    print(f"{batch*BATCH_SIZE} / {min(df.size, MAX_INDEX)}")
+                    tasks = []
+
+                    for row in dataframe[batch * BATCH_SIZE : (batch + 1) * BATCH_SIZE]:
+                        task = asyncio.create_task(
+                            evaluate_response(model, row, benchmark)
+                        )
+                        tasks.append(task)
+
+                    responses_so_far = await asyncio.gather(*tasks)
+                    inferred_labels_so_far, true_labels_so_far = zip(*responses_so_far)
+                    inferred_labels += inferred_labels_so_far
+                    true_labels += true_labels_so_far
 
                 correct = np.equal(inferred_labels, true_labels)
                 score = np.sum(correct) / correct.size
@@ -178,6 +223,8 @@ def main():
                     "trueLabels": true_labels,
                     "score": score,
                 }
+
+                results = {}
                 if model in results:
                     results[model][benchmark] = formatted_results
                 else:
@@ -195,8 +242,9 @@ def main():
 
 try:
     client = OpenAI()
+    async_client = AsyncOpenAI()
 except:
     print("OpenAI client not set up, OpenAI endpoints will not work.")
 
-MAX_INDEX = 1_000_000_000
-main()
+MAX_INDEX = 1_000_000
+asyncio.run(main())
