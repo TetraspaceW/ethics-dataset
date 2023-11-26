@@ -246,5 +246,5 @@ try:
 except:
     print("OpenAI client not set up, OpenAI endpoints will not work.")
 
-MAX_INDEX = 1_000_000
+MAX_INDEX = 500
 asyncio.run(main())
